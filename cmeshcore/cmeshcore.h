@@ -55,6 +55,20 @@ int32_t cmeshcore_send_msg_txt(
     const uint8_t pk[6],
     const char *msg);
 
+/**
+ * Sends a flood advert on the device handle.
+ */
+CMESHCORE_API
+CMESHCORE_WARN_UNUSED
+int32_t cmeshcore_advert_self_flood(cmeshcore_s mesh);
+
+/**
+ * Sends a zero-hop advert on the device handle.
+ */
+CMESHCORE_API
+CMESHCORE_WARN_UNUSED
+int32_t cmeshcore_advert_self_zero_hop(cmeshcore_s mesh);
+
 
 #ifdef __cplusplus
 }

@@ -36,6 +36,7 @@ typedef enum cmeshcore_cmd {
   cmeshcore_cmd_app_start         = 1,
   cmeshcore_cmd_send_txt_msg      = 2,
   cmeshcore_cmd_send_chan_txt_msg = 3,
+  cmeshcore_cmd_send_self_advert  = 7,
   cmeshcore_cmd_device_query      = 22,
 } cmeshcore_cmd;
 
@@ -68,12 +69,10 @@ typedef enum cmeshcore_app_version {
   cmeshcore_app_version_3 = 3,
 } cmeshcore_app_version;
 
-typedef enum cmeshcore_advert_type {
-  cmeshcore_advert_type_none     = 0,
-  cmeshcore_advert_type_chat     = 1,
-  cmeshcore_advert_type_repeater = 2,
-  cmeshcore_advert_type_room     = 3,
-} cmeshcore_advert_type;
+typedef enum cmeshcore_self_advert_type {
+  cmeshcore_self_advert_type_zero_hop = 0,
+  cmeshcore_self_advert_type_flood    = 1,
+} cmeshcore_self_advert_type;
 
 
 static int32_t cmeshcore_write(
@@ -260,25 +259,27 @@ cmeshcore* cmeshcore_new(const char *port) {
     return NULL;
   }
 
-  *mesh = (cmeshcore) {
-    .fd = fd,
-  };
-
   int32_t rv = cmeshcore_write_app_start(fd);
 
   if (rv == -1) {
+    tcflush(fd, TCIOFLUSH);
     close(fd);
     free(mesh);
     return NULL;
   }
 
-  rv = cmeshcore_wait_for_self_info(fd, 2000);
+  rv = cmeshcore_wait_for_self_info(fd, 10000);
 
   if (rv == -1) {
+    tcflush(fd, TCIOFLUSH);
     close(fd);
     free(mesh);
     return NULL;
   }
+
+  *mesh = (cmeshcore) {
+    .fd = fd,
+  };
 
   return mesh;
 }
@@ -335,5 +336,31 @@ int32_t cmeshcore_send_msg_txt(
 
   return cmeshcore_write_frame(mesh->fd, payload, payload_len);
 
-  // TODO: wait for device response for status
+  // TODO: wait for device response for status codes
+}
+
+int32_t cmeshcore_advert_self_flood(cmeshcore_s mesh) {
+  CMESHCORE_ASSERT(mesh);
+
+  const uint8_t payload[2] = {
+    cmeshcore_cmd_send_self_advert,
+    cmeshcore_self_advert_type_flood,
+  };
+
+  return cmeshcore_write_frame(mesh->fd, payload, 2);
+
+  // TODO: wait for device response for status codes
+}
+
+int32_t cmeshcore_advert_self_zero_hop(cmeshcore_s mesh) {
+  CMESHCORE_ASSERT(mesh);
+
+  const uint8_t payload[2] = {
+    cmeshcore_cmd_send_self_advert,
+    cmeshcore_self_advert_type_zero_hop,
+  };
+
+  return cmeshcore_write_frame(mesh->fd, payload, 2);
+
+  // TODO: wait for device response for status codes
 }
