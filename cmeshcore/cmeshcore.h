@@ -17,8 +17,8 @@ extern "C" {
 
 
 /**
-* The device handle
-*/
+ * The device handle
+ */
 typedef struct cmeshcore* cmeshcore_s;
 typedef const struct cmeshcore* cmeshcore_const_s;
 

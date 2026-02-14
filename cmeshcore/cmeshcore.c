@@ -3,8 +3,6 @@
 #include <string.h>
 #include <assert.h>
 
-#include "cmeshcore.h"
-
 #include <errno.h>
 #include <fcntl.h>
 #include <termios.h>
@@ -12,18 +10,15 @@
 #include <time.h>
 #include <poll.h>
 
-#ifndef CMESHCORE_ASSERT
-#ifndef NDEBUG
-#define CMESHCORE_ASSERT(x) (assert(x))
-#else
-#define CMESHCORE_ASSERT(x)
-#endif
-#else
-#endif
+#include "cmeshcore.h"
+#include "cmeshcore-utils.h"
+#include "cmeshcore-buffer.h"
 
 
 typedef struct cmeshcore {
   int32_t fd;
+  cmeshcore_buffer rxbuf;
+  cmeshcore_buffer txbuf;
 } cmeshcore;
 
 
@@ -109,23 +104,12 @@ static int32_t cmeshcore_write(
 
 static int32_t cmeshcore_write_frame(
     int32_t fd,
-    const uint8_t *payload,
-    uint32_t payload_len)
+    cmeshcore_buffer *txbuf)
 {
   CMESHCORE_ASSERT(fd >= 0);
-  CMESHCORE_ASSERT(payload_len <= UINT16_MAX);
+  CMESHCORE_ASSERT(txbuf);
 
-  const uint8_t header[3] = {
-    cmeshcore_frame_out,
-    payload_len & 0xFF,
-    (payload_len >> 8) & 0xFF,
-  };
-
-  if (cmeshcore_write(fd, header, sizeof(header)) == -1) {
-    return -1;
-  }
-
-  if (cmeshcore_write(fd, payload, payload_len) == -1) {
+  if (cmeshcore_write(fd, txbuf->data, txbuf->size) == -1) {
     return -1;
   }
 
@@ -136,8 +120,10 @@ static int32_t cmeshcore_write_frame(
   return 0;
 }
 
-static int32_t cmeshcore_write_app_start(int32_t fd) {
-  CMESHCORE_ASSERT(fd >= 0);
+static int32_t cmeshcore_write_app_start(cmeshcore *mesh) {
+  CMESHCORE_ASSERT(mesh);
+
+  cmeshcore_buffer_clear(&mesh->txbuf);
 
   const uint8_t payload[] = {
     cmeshcore_cmd_app_start,
@@ -146,7 +132,21 @@ static int32_t cmeshcore_write_app_start(int32_t fd) {
     0x63, 0x6d, 0x65, 0x73, 0x68, 0x63, 0x6f, 0x72, 0x65 // cmeshcore
   };
 
-  return cmeshcore_write_frame(fd, payload, sizeof(payload));
+  const uint8_t frame_header[3] = {
+    cmeshcore_frame_out,
+    sizeof(payload) & 0xFF,
+    (sizeof(payload) >> 8) & 0xFF,
+  };
+
+  if (cmeshcore_buffer_append(&mesh->txbuf, frame_header, sizeof(frame_header)) != 0) {
+    return -1;
+  }
+
+  if (cmeshcore_buffer_append(&mesh->txbuf, payload, sizeof(payload)) != 0) {
+    return -1;
+  }
+
+  return cmeshcore_write_frame(mesh->fd, &mesh->txbuf);
 }
 
 static int32_t cmeshcore_poll(int32_t fd, int32_t timeout) {
@@ -228,9 +228,26 @@ cmeshcore* cmeshcore_new(const char *port) {
   cmeshcore *mesh = malloc(sizeof(cmeshcore));
   if (!mesh) { return NULL; }
 
+  cmeshcore_buffer rxbuf;
+
+  if (cmeshcore_buffer_init(&rxbuf, 4096) != 0) {
+    free(mesh);
+    return NULL;
+  }
+
+  cmeshcore_buffer txbuf;
+
+  if (cmeshcore_buffer_init(&txbuf, 4096) != 0) {
+    cmeshcore_buffer_free(&rxbuf);
+    free(mesh);
+    return NULL;
+  }
+
   int32_t fd = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK);
 
   if (fd == -1) {
+    cmeshcore_buffer_free(&txbuf);
+    cmeshcore_buffer_free(&rxbuf);
     free(mesh);
     return NULL;
   }
@@ -239,6 +256,8 @@ cmeshcore* cmeshcore_new(const char *port) {
 
   if (tcgetattr(fd, &opts) == -1) {
     close(fd);
+    cmeshcore_buffer_free(&txbuf);
+    cmeshcore_buffer_free(&rxbuf);
     free(mesh);
     return NULL;
   }
@@ -255,15 +274,26 @@ cmeshcore* cmeshcore_new(const char *port) {
 
   if (tcsetattr(fd, TCSAFLUSH, &opts) == -1) {
     close(fd);
+    cmeshcore_buffer_free(&txbuf);
+    cmeshcore_buffer_free(&rxbuf);
     free(mesh);
     return NULL;
   }
 
-  int32_t rv = cmeshcore_write_app_start(fd);
+  // Initialize mesh struct early so we can use txbuf
+  *mesh = (cmeshcore) {
+    .fd = fd,
+    .rxbuf = rxbuf,
+    .txbuf = txbuf,
+  };
+
+  int32_t rv = cmeshcore_write_app_start(mesh);
 
   if (rv == -1) {
     tcflush(fd, TCIOFLUSH);
     close(fd);
+    cmeshcore_buffer_free(&mesh->txbuf);
+    cmeshcore_buffer_free(&mesh->rxbuf);
     free(mesh);
     return NULL;
   }
@@ -273,13 +303,11 @@ cmeshcore* cmeshcore_new(const char *port) {
   if (rv == -1) {
     tcflush(fd, TCIOFLUSH);
     close(fd);
+    cmeshcore_buffer_free(&mesh->txbuf);
+    cmeshcore_buffer_free(&mesh->rxbuf);
     free(mesh);
     return NULL;
   }
-
-  *mesh = (cmeshcore) {
-    .fd = fd,
-  };
 
   return mesh;
 }
@@ -293,6 +321,9 @@ void cmeshcore_free(cmeshcore * const mesh) {
     close(mesh->fd);
     mesh->fd = -1;
   }
+
+  cmeshcore_buffer_free(&mesh->txbuf);
+  cmeshcore_buffer_free(&mesh->rxbuf);
 
   free(mesh);
 }
@@ -308,33 +339,46 @@ int32_t cmeshcore_send_msg_txt(
   if (!msg) { return -1; }
 
   const uint32_t msg_len = strlen(msg);
+  const uint32_t ts = (uint32_t)time(NULL);
 
-  // cmd(1) + type(1) + attempt(1) + timestamp(4) + pk(6) + msg
+  cmeshcore_buffer_clear(&mesh->txbuf);
+
   const uint32_t payload_len = 7 + 6 + msg_len;
 
-  // TODO: arbitrary limit so we do not need
-  // to take care of dynamic memory management
+  const uint8_t frame_header[3] = {
+    cmeshcore_frame_out,
+    payload_len & 0xFF,
+    (payload_len >> 8) & 0xFF,
+  };
 
-  if (payload_len > 4096) {
+  if (cmeshcore_buffer_append(&mesh->txbuf, frame_header, sizeof(frame_header)) != 0) {
     return -1;
   }
 
-  uint8_t payload[4096];
+  // cmd(1) + type(1) + attempt(1) + timestamp(4) + pk(6) + msg
+  const uint8_t payload_header[] = {
+    cmeshcore_cmd_send_txt_msg,
+    cmeshcore_txt_type_plain,
+    0, // attempt
+    ts & 0xFF,
+    (ts >> 8) & 0xFF,
+    (ts >> 16) & 0xFF,
+    (ts >> 24) & 0xFF,
+  };
 
-  const uint32_t ts = (uint32_t)time(NULL);
+  if (cmeshcore_buffer_append(&mesh->txbuf, payload_header, sizeof(payload_header)) != 0) {
+    return -1;
+  }
 
-  payload[0] = cmeshcore_cmd_send_txt_msg;
-  payload[1] = cmeshcore_txt_type_plain;
-  payload[2] = 0; // attempt
-  payload[3] = ts & 0xFF;
-  payload[4] = (ts >> 8) & 0xFF;
-  payload[5] = (ts >> 16) & 0xFF;
-  payload[6] = (ts >> 24) & 0xFF;
+  if (cmeshcore_buffer_append(&mesh->txbuf, pk, 6) != 0) {
+    return -1;
+  }
 
-  memcpy(payload + 7, pk, 6);
-  memcpy(payload + 13, msg, msg_len);
+  if (cmeshcore_buffer_append(&mesh->txbuf, (const uint8_t*)msg, msg_len) != 0) {
+    return -1;
+  }
 
-  return cmeshcore_write_frame(mesh->fd, payload, payload_len);
+  return cmeshcore_write_frame(mesh->fd, &mesh->txbuf);
 
   // TODO: wait for device response for status codes
 }
@@ -342,12 +386,28 @@ int32_t cmeshcore_send_msg_txt(
 int32_t cmeshcore_advert_self_flood(cmeshcore_s mesh) {
   CMESHCORE_ASSERT(mesh);
 
+  cmeshcore_buffer_clear(&mesh->txbuf);
+
   const uint8_t payload[2] = {
     cmeshcore_cmd_send_self_advert,
     cmeshcore_self_advert_type_flood,
   };
 
-  return cmeshcore_write_frame(mesh->fd, payload, 2);
+  const uint8_t frame_header[3] = {
+    cmeshcore_frame_out,
+    sizeof(payload) & 0xFF,
+    (sizeof(payload) >> 8) & 0xFF,
+  };
+
+  if (cmeshcore_buffer_append(&mesh->txbuf, frame_header, sizeof(frame_header)) != 0) {
+    return -1;
+  }
+
+  if (cmeshcore_buffer_append(&mesh->txbuf, payload, sizeof(payload)) != 0) {
+    return -1;
+  }
+
+  return cmeshcore_write_frame(mesh->fd, &mesh->txbuf);
 
   // TODO: wait for device response for status codes
 }
@@ -355,12 +415,28 @@ int32_t cmeshcore_advert_self_flood(cmeshcore_s mesh) {
 int32_t cmeshcore_advert_self_zero_hop(cmeshcore_s mesh) {
   CMESHCORE_ASSERT(mesh);
 
+  cmeshcore_buffer_clear(&mesh->txbuf);
+
   const uint8_t payload[2] = {
     cmeshcore_cmd_send_self_advert,
     cmeshcore_self_advert_type_zero_hop,
   };
 
-  return cmeshcore_write_frame(mesh->fd, payload, 2);
+  const uint8_t frame_header[3] = {
+    cmeshcore_frame_out,
+    sizeof(payload) & 0xFF,
+    (sizeof(payload) >> 8) & 0xFF,
+  };
+
+  if (cmeshcore_buffer_append(&mesh->txbuf, frame_header, sizeof(frame_header)) != 0) {
+    return -1;
+  }
+
+  if (cmeshcore_buffer_append(&mesh->txbuf, payload, sizeof(payload)) != 0) {
+    return -1;
+  }
+
+  return cmeshcore_write_frame(mesh->fd, &mesh->txbuf);
 
   // TODO: wait for device response for status codes
 }

@@ -16,7 +16,7 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  if (cmeshcore_advert_self_flood(mesh) != 0) {
+  if (cmeshcore_advert_self_zero_hop(mesh) != 0) {
     fprintf(stderr, "error: unable to advert self\n");
     cmeshcore_free(mesh);
     return EXIT_FAILURE;
