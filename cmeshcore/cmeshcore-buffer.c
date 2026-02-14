@@ -91,3 +91,19 @@ void cmeshcore_buffer_clear(cmeshcore_buffer *buf) {
 
   buf->size = 0;
 }
+
+void cmeshcore_buffer_consume(cmeshcore_buffer *buf, size_t bytes_len) {
+  CMESHCORE_ASSERT(buf);
+
+  if (bytes_len == 0) { return; }
+
+  if (bytes_len >= buf->size) {
+    buf->size = 0;
+
+    return;
+  }
+
+  memmove(buf->data, buf->data + bytes_len, buf->size - bytes_len);
+
+  buf->size -= bytes_len;
+}

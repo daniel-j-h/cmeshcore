@@ -6,7 +6,8 @@
 
 
 int main(int argc, char *argv[]) {
-  const char *port = argc == 2 ? argv[1] : "/dev/ttyACM0";
+  const char *port = argc >= 2 ? argv[1] : "/dev/ttyACM0";
+  const char *msg = argc >= 3 ? argv[2] : "Hi!";
 
   cmeshcore_s mesh = cmeshcore_new(port);
 
@@ -22,7 +23,7 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  const char *msg = "Hi!";
+  // TODO: parse from argv
   const uint8_t pk[6] = {0x40, 0x2b, 0xfe, 0x9d, 0x13, 0x2e};
 
   if (cmeshcore_send_msg_txt(mesh, pk, msg) != 0) {

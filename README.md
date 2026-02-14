@@ -68,6 +68,12 @@ To debug the serial communication
 strace -e open,read,write,close ./cmeshcore-cli /dev/serial/by-id/usb-Heltec..
 ```
 
+and keep in mind the frame structure
+
+```bash
+[0x3c/0x3e] [len_lo] [len_hi] [packet_type] [packet_data ..]
+```
+
 
 ## License
 

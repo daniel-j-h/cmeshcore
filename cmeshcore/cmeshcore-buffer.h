@@ -35,5 +35,9 @@ int32_t cmeshcore_buffer_append(
 void cmeshcore_buffer_clear(
     cmeshcore_buffer *buf);
 
+void cmeshcore_buffer_consume(
+    cmeshcore_buffer *buf,
+    size_t bytes_len);
+
 
 #endif

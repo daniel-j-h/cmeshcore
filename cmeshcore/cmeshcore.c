@@ -123,8 +123,6 @@ static int32_t cmeshcore_write_frame(
 static int32_t cmeshcore_write_app_start(cmeshcore *mesh) {
   CMESHCORE_ASSERT(mesh);
 
-  cmeshcore_buffer_clear(&mesh->txbuf);
-
   const uint8_t payload[] = {
     cmeshcore_cmd_app_start,
     cmeshcore_app_version_3,
@@ -137,6 +135,8 @@ static int32_t cmeshcore_write_app_start(cmeshcore *mesh) {
     sizeof(payload) & 0xFF,
     (sizeof(payload) >> 8) & 0xFF,
   };
+
+  cmeshcore_buffer_clear(&mesh->txbuf);
 
   if (cmeshcore_buffer_append(&mesh->txbuf, frame_header, sizeof(frame_header)) != 0) {
     return -1;
@@ -185,40 +185,183 @@ static int32_t cmeshcore_poll(int32_t fd, int32_t timeout) {
   return -1;
 }
 
-static int32_t cmeshcore_wait_for_self_info(int32_t fd, int32_t timeout) {
+static int32_t cmeshcore_read_bytes(
+    int32_t fd,
+    cmeshcore_buffer *rxbuf,
+    size_t max_bytes)
+{
   CMESHCORE_ASSERT(fd >= 0);
-  CMESHCORE_ASSERT(timeout > 0);
+  CMESHCORE_ASSERT(rxbuf);
 
-  // TODO: make this robust, meaning
-  // - handle EINTR, EAGAIN
-  // - proper read buffer
-  // - partial reads
-  // - pushed frames before self info
-  // - parse full self info frame
+  uint8_t temp[1024];
 
-  int32_t rv = cmeshcore_poll(fd, timeout);
+  const size_t to_read = max_bytes < sizeof(temp) ? max_bytes : sizeof(temp);
 
-  if (rv <= 0) {
+  int32_t n = read(fd, temp, to_read);
+
+  if (n == -1) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return 0;
+    } else if (errno == EINTR) {
+      return 0;
+    } else {
+      return -1;
+    }
+  }
+
+  if (n == 0) {
     return -1;
   }
 
-  uint8_t buf[4096];
-
-  const uint32_t n = read(fd, buf, sizeof(buf));
-
-  if (n < 4) {
+  if (cmeshcore_buffer_append(rxbuf, temp, n) != 0) {
     return -1;
   }
 
-  if (buf[0] != cmeshcore_frame_in) {
+  return n;
+}
+
+static int32_t cmeshcore_extract_frame(
+    cmeshcore_buffer *rxbuf,
+    uint8_t **out_payload,
+    size_t *out_size)
+{
+  CMESHCORE_ASSERT(rxbuf);
+  CMESHCORE_ASSERT(out_payload);
+  CMESHCORE_ASSERT(out_size);
+
+  if (rxbuf->size < 3) {
     return -1;
   }
 
-  if (buf[3] != cmeshcore_resp_self_info) {
+  if (rxbuf->data[0] != cmeshcore_frame_in) {
+    cmeshcore_buffer_consume(rxbuf, 1);
+    return -2;
+  }
+
+  const uint16_t payload_size = rxbuf->data[1] | (rxbuf->data[2] << 8);
+
+  if (payload_size == 0) {
+    cmeshcore_buffer_consume(rxbuf, 1);
+    return -2;
+  }
+
+  const size_t frame_size = 3 + payload_size;
+
+  if (rxbuf->size < frame_size) {
     return -1;
+  }
+
+  *out_payload = rxbuf->data + 3;
+  *out_size = payload_size;
+
+  return 0;
+}
+
+static int32_t cmeshcore_check_packet_match(
+    const uint8_t packet_type,
+    const uint8_t *expected_types,
+    size_t num_expected)
+{
+  for (size_t i = 0; i < num_expected; i++) {
+    if (packet_type == expected_types[i]) {
+      return 1;
+    }
   }
 
   return 0;
+}
+
+static int32_t cmeshcore_wait_for_packet_types(
+    cmeshcore *mesh,
+    const uint8_t *expected_types,
+    size_t num_expected,
+    uint8_t **out_payload_ptr,
+    size_t *out_payload_size,
+    int32_t timeout_ms)
+{
+  CMESHCORE_ASSERT(mesh);
+  CMESHCORE_ASSERT(expected_types);
+  CMESHCORE_ASSERT(num_expected > 0);
+
+  const int64_t deadline_ms = (int64_t)timeout_ms + (int64_t)time(NULL) * 1000;
+
+  while (1) {
+    uint8_t *payload;
+    size_t payload_size;
+
+    int32_t rv = cmeshcore_extract_frame(&mesh->rxbuf, &payload, &payload_size);
+
+    if (rv == 0) {
+      const size_t frame_size = 3 + payload_size;
+
+      if (payload_size >= 1) {
+        const uint8_t packet_type = payload[0];
+
+        if (cmeshcore_check_packet_match(packet_type, expected_types, num_expected)) {
+          if (out_payload_ptr && payload_size > 1) {
+            *out_payload_ptr = payload + 1;
+
+            if (out_payload_size) {
+              *out_payload_size = payload_size - 1;
+            }
+          } else {
+            if (out_payload_ptr) {
+              *out_payload_ptr = NULL;
+            }
+
+            if (out_payload_size) {
+              *out_payload_size = 0;
+            }
+          }
+
+          cmeshcore_buffer_consume(&mesh->rxbuf, frame_size);
+
+          return packet_type;
+        }
+      }
+
+      cmeshcore_buffer_consume(&mesh->rxbuf, frame_size);
+
+      continue;
+    }
+
+    if (rv == -2) {
+      continue;
+    }
+
+    const int64_t now_ms = (int64_t)time(NULL) * 1000;
+    const int32_t remaining_ms = (int32_t)(deadline_ms - now_ms);
+
+    if (remaining_ms <= 0) {
+      return -1;
+    }
+
+    rv = cmeshcore_poll(mesh->fd, remaining_ms);
+
+    if (rv <= 0) {
+      return -1;
+    }
+
+    rv = cmeshcore_read_bytes(mesh->fd, &mesh->rxbuf, 1024);
+
+    if (rv < 0) {
+      return -1;
+    }
+  }
+}
+
+static int32_t cmeshcore_wait_for_self_info(cmeshcore *mesh, int32_t timeout_ms) {
+  CMESHCORE_ASSERT(mesh);
+  CMESHCORE_ASSERT(timeout_ms > 0);
+
+  const uint8_t expected[] = { cmeshcore_resp_self_info };
+
+  // TODO: parse response frame
+
+  int32_t packet_type = cmeshcore_wait_for_packet_types(
+      mesh, expected, 1, NULL, NULL, timeout_ms);
+
+  return packet_type == cmeshcore_resp_self_info ? 0 : -1;
 }
 
 
@@ -298,7 +441,7 @@ cmeshcore* cmeshcore_new(const char *port) {
     return NULL;
   }
 
-  rv = cmeshcore_wait_for_self_info(fd, 10000);
+  rv = cmeshcore_wait_for_self_info(mesh, 10000);
 
   if (rv == -1) {
     tcflush(fd, TCIOFLUSH);
@@ -341,8 +484,6 @@ int32_t cmeshcore_send_msg_txt(
   const uint32_t msg_len = strlen(msg);
   const uint32_t ts = (uint32_t)time(NULL);
 
-  cmeshcore_buffer_clear(&mesh->txbuf);
-
   const uint32_t payload_len = 7 + 6 + msg_len;
 
   const uint8_t frame_header[3] = {
@@ -351,15 +492,16 @@ int32_t cmeshcore_send_msg_txt(
     (payload_len >> 8) & 0xFF,
   };
 
+  cmeshcore_buffer_clear(&mesh->txbuf);
+
   if (cmeshcore_buffer_append(&mesh->txbuf, frame_header, sizeof(frame_header)) != 0) {
     return -1;
   }
 
-  // cmd(1) + type(1) + attempt(1) + timestamp(4) + pk(6) + msg
   const uint8_t payload_header[] = {
     cmeshcore_cmd_send_txt_msg,
     cmeshcore_txt_type_plain,
-    0, // attempt
+    0,
     ts & 0xFF,
     (ts >> 8) & 0xFF,
     (ts >> 16) & 0xFF,
@@ -378,15 +520,22 @@ int32_t cmeshcore_send_msg_txt(
     return -1;
   }
 
-  return cmeshcore_write_frame(mesh->fd, &mesh->txbuf);
+  if (cmeshcore_write_frame(mesh->fd, &mesh->txbuf) != 0) {
+    return -1;
+  }
 
-  // TODO: wait for device response for status codes
+  const uint8_t expected[] = { cmeshcore_resp_sent, cmeshcore_resp_error };
+
+  // TODO: parse response frame
+
+  int32_t packet_type = cmeshcore_wait_for_packet_types(
+      mesh, expected, 2, NULL, NULL, 5000);
+
+  return packet_type == cmeshcore_resp_sent ? 0 : -1;
 }
 
 int32_t cmeshcore_advert_self_flood(cmeshcore_s mesh) {
   CMESHCORE_ASSERT(mesh);
-
-  cmeshcore_buffer_clear(&mesh->txbuf);
 
   const uint8_t payload[2] = {
     cmeshcore_cmd_send_self_advert,
@@ -399,6 +548,8 @@ int32_t cmeshcore_advert_self_flood(cmeshcore_s mesh) {
     (sizeof(payload) >> 8) & 0xFF,
   };
 
+  cmeshcore_buffer_clear(&mesh->txbuf);
+
   if (cmeshcore_buffer_append(&mesh->txbuf, frame_header, sizeof(frame_header)) != 0) {
     return -1;
   }
@@ -407,15 +558,22 @@ int32_t cmeshcore_advert_self_flood(cmeshcore_s mesh) {
     return -1;
   }
 
-  return cmeshcore_write_frame(mesh->fd, &mesh->txbuf);
+  if (cmeshcore_write_frame(mesh->fd, &mesh->txbuf) != 0) {
+    return -1;
+  }
 
-  // TODO: wait for device response for status codes
+  const uint8_t expected[] = { cmeshcore_resp_ok, cmeshcore_resp_error };
+
+  // TODO: parse response frame
+
+  int32_t packet_type = cmeshcore_wait_for_packet_types(
+      mesh, expected, 2, NULL, NULL, 5000);
+
+  return packet_type == cmeshcore_resp_ok ? 0 : -1;
 }
 
 int32_t cmeshcore_advert_self_zero_hop(cmeshcore_s mesh) {
   CMESHCORE_ASSERT(mesh);
-
-  cmeshcore_buffer_clear(&mesh->txbuf);
 
   const uint8_t payload[2] = {
     cmeshcore_cmd_send_self_advert,
@@ -428,6 +586,8 @@ int32_t cmeshcore_advert_self_zero_hop(cmeshcore_s mesh) {
     (sizeof(payload) >> 8) & 0xFF,
   };
 
+  cmeshcore_buffer_clear(&mesh->txbuf);
+
   if (cmeshcore_buffer_append(&mesh->txbuf, frame_header, sizeof(frame_header)) != 0) {
     return -1;
   }
@@ -436,7 +596,16 @@ int32_t cmeshcore_advert_self_zero_hop(cmeshcore_s mesh) {
     return -1;
   }
 
-  return cmeshcore_write_frame(mesh->fd, &mesh->txbuf);
+  if (cmeshcore_write_frame(mesh->fd, &mesh->txbuf) != 0) {
+    return -1;
+  }
 
-  // TODO: wait for device response for status codes
+  const uint8_t expected[] = { cmeshcore_resp_ok, cmeshcore_resp_error };
+
+  // TODO: parse response frame
+
+  int32_t packet_type = cmeshcore_wait_for_packet_types(
+      mesh, expected, 2, NULL, NULL, 5000);
+
+  return packet_type == cmeshcore_resp_ok ? 0 : -1;
 }
